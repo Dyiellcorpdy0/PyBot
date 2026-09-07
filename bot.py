@@ -5,19 +5,16 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-
 TOKEN = "8842524737:AAEoMyRLQWqO3LOggkDaFMlQ00b2-vKW46s"
 ADMIN_IDS = [883080434]
 
-
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "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"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Хранилище истории диалогов
@@ -38,31 +35,21 @@ SYSTEM_PROMPT = """
 
 Отвечай вежливо, профессионально и помогай решать вопросы учеников.
 
-ВАЖНО: Если ты замечаешь, что пользователь недоволен, конфликтует, жалуется или его вопрос не может быть решен через AI, 
-ТЫ ДОЛЖЕН:
-1. Сообщить пользователю: "Я понимаю ваше беспокойство. Администратор свяжется с вами в течение часа, чтобы решить ваш вопрос."
-2. Собрать следующую информацию для администратора:
-   - ID пользователя
-   - Имя пользователя
-   - Суть проблемы/конфликта
-   - Последние сообщения диалога
-   - Время обращения
-3. Сгенерировать отчет в формате: "КОНФЛИКТ: [описание] | ПОЛЬЗОВАТЕЛЬ: [ID] [имя] | СООБЩЕНИЯ: [последние 3 сообщения] | ВРЕМЯ: [время]"
+ВАЖНО: Если пользователь задает вопрос, который ты не знаешь, или проявляет недовольство:
+1. НЕ говори, что администратор свяжется с ним сразу.
+2. ВЕЖЛИВО попроси пользователя оставить контактные данные (имя, телефон или Telegram).
+3. Скажи: "Я передам ваши контактные данные администратору, и он свяжется с вами в ближайшее время."
+4. Если пользователь уже оставил контакты, поблагодари его и скажи, что администратор свяжется с ним.
+
+Всегда будь вежливым и профессиональным. Помогай пользователям с общей информацией о школе.
 """
 
-# АКТУАЛЬНЫЕ БЕСПЛАТНЫЕ МОДЕЛИ НА OPENROUTER (на 2026 год)
+# ТОЛЬКО ЭТА МОДЕЛЬ
 AVAILABLE_MODELS = [
-    "google/gemini-2.0-flash-lite-001",
-    "google/gemini-flash-1.5",
-    "mistralai/mistral-7b-instruct-v0.1",
-    "meta-llama/llama-3.2-1b-instruct",
-    "microsoft/phi-3.5-mini-128k-instruct",
-    "qwen/qwen-2.5-0.5b-instruct",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
 ]
 
-
 current_model_index = 0
-
 
 CONFLICT_KEYWORDS = [
     "жалоб", "недовол", "плох", "ужасн", "кошмар",
@@ -72,20 +59,17 @@ CONFLICT_KEYWORDS = [
     "ужасно", "отвратительн", "возмущ", "негод"
 ]
 
+# Ключевые слова для запроса администратора
+ADMIN_REQUEST_KEYWORDS = [
+    "администратор", "менеджер", "директор", "руководитель",
+    "позвать", "позовите", "свяжите", "свяжись", "поговорить",
+    "личный", "лично", "жаловаться", "претензия"
+]
+
 
 def get_current_model():
     """Получить текущую модель"""
-    global current_model_index
-    if current_model_index >= len(AVAILABLE_MODELS):
-        current_model_index = 0
-    return AVAILABLE_MODELS[current_model_index]
-
-
-def switch_to_next_model():
-    """Переключиться на следующую модель"""
-    global current_model_index
-    current_model_index = (current_model_index + 1) % len(AVAILABLE_MODELS)
-    return get_current_model()
+    return AVAILABLE_MODELS[0]
 
 
 def get_main_keyboard():
@@ -132,36 +116,78 @@ def detect_conflict(text: str) -> bool:
     return False
 
 
-async def notify_admin_conflict(user_id: int, user_name: str, issue: str, conversation_history: list,
-                                context: ContextTypes.DEFAULT_TYPE):
-    """Отправить уведомление администратору о конфликте"""
-    # Собираем последние сообщения (до 5 штук)
-    last_messages = []
-    for msg in conversation_history[-10:]:
-        if msg["role"] in ["user", "assistant"]:
-            role = "Пользователь" if msg["role"] == "user" else "AI"
-            last_messages.append(f"{role}: {msg['content'][:200]}...")
+def detect_admin_request(text: str) -> bool:
+    """Определение запроса на связь с администратором"""
+    text_lower = text.lower()
+    for keyword in ADMIN_REQUEST_KEYWORDS:
+        if keyword in text_lower:
+            return True
+    return False
 
+
+async def request_contact_info(update: Update, context: ContextTypes.DEFAULT_TYPE, reason: str = ""):
+    """Запросить контактные данные у пользователя"""
+    user_id = update.effective_user.id
+    user_name = update.effective_user.full_name or update.effective_user.username or str(user_id)
+
+    # Сохраняем состояние
+    context.user_data['waiting_for_contact'] = True
+    context.user_data['user_name'] = user_name
+    context.user_data['reason'] = reason
+
+    response = (
+        "👋 Для того чтобы администратор мог связаться с вами, пожалуйста, укажите:\n\n"
+        "📱 **Ваш номер телефона** (или напишите, что предпочитаете Telegram)\n"
+        "👤 **Ваше имя**\n"
+        "❓ **Кратко опишите вопрос**\n\n"
+        "📝 Пример: \"Иван, +375291234567, хочу записаться на курс Python\"\n\n"
+        "После получения контактов администратор свяжется с вами в ближайшее время ⏰"
+    )
+
+    await update.message.reply_text(
+        response,
+        reply_markup=get_ai_keyboard(),
+        parse_mode='Markdown'
+    )
+
+
+async def handle_contact_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка контактных данных от пользователя"""
+    user_id = update.effective_user.id
+    user_message = update.message.text
+    user_name = context.user_data.get('user_name', 'Неизвестно')
+    reason = context.user_data.get('reason', 'Запрос на связь с администратором')
+
+    # Собираем контактную информацию
+    contact_info = {
+        "user_id": user_id,
+        "user_name": user_name,
+        "contact": user_message,
+        "reason": reason,
+        "time": datetime.now().strftime('%d.%m.%Y %H:%M:%S')
+    }
+
+    # Формируем отчет для администратора
     report = (
-        f" **НОВЫЙ КОНФЛИКТ В CHATBOT!**\n\n"
-        f" **Пользователь:** {user_name}\n"
-        f" **ID:** {user_id}\n"
-        f" **Описание:** {issue}\n"
-        f" **Время:** {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
-        f" **Последние сообщения:**\n"
-        f"{chr(10).join(last_messages)}\n\n"
-        f" Администратор должен связаться с пользователем в течение часа!"
+        f"🆕 **ЗАПРОС НА СВЯЗЬ С АДМИНИСТРАТОРОМ**\n\n"
+        f"👤 **Пользователь:** {user_name}\n"
+        f"🆔 **ID:** {user_id}\n"
+        f"📱 **Контактные данные:**\n{user_message}\n\n"
+        f"❓ **Причина запроса:** {reason}\n"
+        f"⏰ **Время:** {contact_info['time']}\n\n"
+        f"⚠️ Администратор должен связаться с пользователем в течение часа!"
     )
 
     # Сохраняем отчет
     conflict_reports[user_id] = {
         "time": datetime.now(),
         "report": report,
-        "issue": issue,
-        "user_name": user_name
+        "contact": user_message,
+        "user_name": user_name,
+        "reason": reason
     }
 
-    # Отправляем всем администраторам
+    # Отправляем администратору
     for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_message(
@@ -171,6 +197,18 @@ async def notify_admin_conflict(user_id: int, user_name: str, issue: str, conver
             )
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
+    # Очищаем состояние ожидания
+    context.user_data['waiting_for_contact'] = False
+
+    # Отвечаем пользователю
+    await update.message.reply_text(
+        "✅ **Спасибо! Ваши контакты переданы администратору.**\n\n"
+        "Администратор свяжется с вами в ближайшее время ⏰\n\n"
+        "Если у вас есть еще вопросы, вы можете продолжить общение с ботом 🤖",
+        reply_markup=get_ai_keyboard(),
+        parse_mode='Markdown'
+    )
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,8 +223,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             " **О школе IT School**\n\n"
             "Современная школа программирования!\n\n"
-            " Миссия: Сделать IT-образование доступным\n"
-            " Мы находимся в Минске\n\n"
+            " Миссия: Сделать IT-образование доступным\n\n"
             "Наши преимущества:\n"
             "• Опытные преподаватели-практики\n"
             "• Современные методики обучения\n"
@@ -270,10 +307,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def get_ai_response(messages: list, retry_count: int = 0) -> str:
-    """Получение ответа от AI через OpenRouter с автоматической сменой модели при ошибке"""
+async def get_ai_response(messages: list) -> str:
+    """Получение ответа от AI через OpenRouter"""
     try:
-        if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "sk-ваш_ключ_от_openrouter":
+        if not OPENROUTER_API_KEY:
             return "⚠ API ключ не настроен.\n\nПолучите бесплатный ключ на openrouter.ai"
 
         model = get_current_model()
@@ -293,28 +330,18 @@ async def get_ai_response(messages: list, retry_count: int = 0) -> str:
                 "temperature": 0.7
             }
 
-            async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=30) as response:
+            async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60) as response:
                 if response.status == 200:
                     result = await response.json()
                     return result["choices"][0]["message"]["content"]
                 else:
                     error_text = await response.text()
                     logger.error(f"OpenRouter error with model {model}: {response.status} - {error_text}")
-
-                    if (response.status == 404 or response.status == 400) and retry_count < len(AVAILABLE_MODELS):
-                        switch_to_next_model()
-                        logger.info(f"Switching to next model: {get_current_model()}")
-                        return await get_ai_response(messages, retry_count + 1)
-
-                    return f"Извините, все AI-модели временно недоступны. Попробуйте позже."
+                    return f"Извините, AI-модель временно недоступна. Попробуйте позже."
     except asyncio.TimeoutError:
-        return " Превышено время ожидания ответа. Попробуйте позже."
+        return "⏰ Превышено время ожидания ответа. Попробуйте позже."
     except Exception as e:
         logger.error(f"OpenRouter error: {e}")
-        if retry_count < len(AVAILABLE_MODELS):
-            switch_to_next_model()
-            logger.info(f"Switching to next model due to error: {get_current_model()}")
-            return await get_ai_response(messages, retry_count + 1)
         return "Произошла ошибка. Попробуйте позже."
 
 
@@ -324,6 +351,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     user_name = update.effective_user.full_name or update.effective_user.username or str(user_id)
 
+    # Проверяем, ждем ли мы контактные данные
+    if context.user_data.get('waiting_for_contact'):
+        await handle_contact_collection(update, context)
+        return
+
     if user_id not in user_conversations:
         user_conversations[user_id] = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -332,61 +364,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="typing")
 
     try:
+        # Проверяем запрос на администратора или конфликт
+        if detect_admin_request(user_message) or detect_conflict(user_message):
+            # Запрашиваем контактные данные
+            reason = f"Запрос пользователя: {user_message[:200]}"
+            await request_contact_info(update, context, reason)
 
-        if detect_conflict(user_message):
-
-            issue = f"Пользователь выразил недовольство: {user_message[:200]}"
-
-
+            # Сохраняем сообщение пользователя в историю
             user_conversations[user_id].append(
                 {"role": "user", "content": user_message}
             )
-
-            # Уведомляем администратора
-            await notify_admin_conflict(
-                user_id=user_id,
-                user_name=user_name,
-                issue=issue,
-                conversation_history=user_conversations[user_id],
-                context=context
-            )
-
-
-            response = (
-                "🙏 Я понимаю ваше беспокойство.\n\n"
-                "Администратор IT School свяжется с вами в течение часа, "
-                "чтобы решить ваш вопрос и помочь вам.\n\n"
-                "Извините за доставленные неудобства. Мы ценим каждого ученика! 💙"
-            )
-
-            # Сохраняем ответ AI в историю
-            user_conversations[user_id].append(
-                {"role": "assistant", "content": response}
-            )
-
-            await update.message.reply_text(
-                response,
-                reply_markup=get_ai_keyboard()
-            )
             return
 
-
+        # Обычная обработка сообщения
         user_conversations[user_id].append(
             {"role": "user", "content": user_message}
         )
 
         response = await get_ai_response(user_conversations[user_id])
 
-
-        if "администратор свяжется" in response.lower() or "в течение часа" in response.lower():
-
-            await notify_admin_conflict(
-                user_id=user_id,
-                user_name=user_name,
-                issue=f"AI обнаружил конфликтную ситуацию. Сообщение пользователя: {user_message[:200]}",
-                conversation_history=user_conversations[user_id],
-                context=context
-            )
+        # Проверяем, не сгенерировал ли AI ответ о необходимости администратора
+        if ("администратор свяжется" in response.lower() or
+                "в течение часа" in response.lower() or
+                "передам администратору" in response.lower()):
+            # Запрашиваем контакты вместо отправки сообщения о конфликте
+            reason = f"AI определил необходимость связи с администратором. Запрос: {user_message[:200]}"
+            await request_contact_info(update, context, reason)
+            return
 
         await update.message.reply_text(
             response,
@@ -397,6 +401,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"role": "assistant", "content": response}
         )
 
+        # Ограничиваем историю
         if len(user_conversations[user_id]) > 21:
             user_conversations[user_id] = [
                                               {"role": "system", "content": SYSTEM_PROMPT}
@@ -405,20 +410,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка AI: {e}")
 
-        # При ошибке тоже уведомляем администратора
-        await notify_admin_conflict(
-            user_id=user_id,
-            user_name=user_name,
-            issue=f"Техническая ошибка при обработке запроса: {str(e)[:200]}",
-            conversation_history=user_conversations.get(user_id, []),
-            context=context
-        )
-
-        await update.message.reply_text(
-            " Извините, произошла ошибка при обработке запроса.\n"
-            "Администратор уже уведомлен и свяжется с вами в ближайшее время.\n\n"
-            "Попробуйте позже или обратитесь к администратору.",
-            reply_markup=get_ai_keyboard()
+        # Вместо ошибки просим контакты
+        await request_contact_info(
+            update,
+            context,
+            f"Техническая ошибка при обработке запроса: {str(e)[:100]}"
         )
 
 
@@ -444,7 +440,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
     await update.message.reply_text(
-        " История диалога очищена!",
+        "🔄 История диалога очищена!",
         reply_markup=get_ai_keyboard()
     )
 
@@ -453,7 +449,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /admin"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text(" Доступ запрещен.")
+        await update.message.reply_text("🚫 Доступ запрещен.")
         return
 
     current_model = get_current_model()
@@ -462,7 +458,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f" Пользователей: {len(user_conversations)}\n"
         f" Сообщений в истории: {sum(len(conv) for conv in user_conversations.values())}\n"
         f" Текущая модель: {current_model}\n"
-        f" Доступно моделей: {len(AVAILABLE_MODELS)}\n"
         f" Конфликтов: {len(conflict_reports)}"
     )
     await update.message.reply_text(stats_text, parse_mode='Markdown')
@@ -472,11 +467,11 @@ async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /reports - просмотр отчетов о конфликтах (только для админов)"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text(" Доступ запрещен.")
+        await update.message.reply_text("🚫 Доступ запрещен.")
         return
 
     if not conflict_reports:
-        await update.message.reply_text(" Нет активных отчетов о конфликтах.")
+        await update.message.reply_text("📭 Нет активных отчетов о конфликтах.")
         return
 
     # Показываем последние 5 отчетов
@@ -488,7 +483,7 @@ async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{report_data['report']}",
             parse_mode='Markdown'
         )
-        await asyncio.sleep(0.5)  # Небольшая задержка между сообщениями
+        await asyncio.sleep(0.5)
 
 
 def main():
@@ -510,10 +505,7 @@ def main():
         print("=" * 50)
         print(" Бот IT School с AI-помощником запущен!")
         print(f" Администраторы: {ADMIN_IDS}")
-        print(f" Доступные модели AI:")
-        for i, model in enumerate(AVAILABLE_MODELS, 1):
-            print(f"   {i}. {model}")
-        print(f" Текущая модель: {get_current_model()}")
+        print(f" Модель AI: {get_current_model()}")
         print(f" Ключевые слова для обнаружения конфликтов: {CONFLICT_KEYWORDS}")
         print("=" * 50)
 
